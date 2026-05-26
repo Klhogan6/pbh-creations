@@ -1,9 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
 import { getStripeClient } from "@/lib/stripe/client";
+import { createSupabaseServiceClient } from "@/lib/supabase/server";
+import type { Database } from "@/lib/supabase/types";
 
-// Disable body parsing — Stripe needs the raw body for signature verification
 export const runtime = "nodejs";
+
+type ProfileUpdate = Database["public"]["Tables"]["profiles"]["Update"];
 
 async function handleCheckoutCompleted(
   session: Stripe.Checkout.Session
@@ -16,7 +19,6 @@ async function handleCheckoutCompleted(
 
   if (!email || !customerId) return;
 
-  // Determine tier from the price ID on the subscription
   let tier: "starter" | "hands_off" = "starter";
   if (subscriptionId) {
     const stripe = getStripeClient();
@@ -29,9 +31,23 @@ async function handleCheckoutCompleted(
     }
   }
 
-  // TODO: Upsert profile in Supabase — feature/supabase-auth
-  // await upsertProfile({ email, stripeCustomerId: customerId, tier, status: "active" });
-  console.log("[webhook] checkout.session.completed", { email, customerId, tier });
+  const supabase = createSupabaseServiceClient();
+
+  // Find the auth user by email
+  const { data: users } = await supabase.auth.admin.listUsers();
+  const user = users?.users.find((u) => u.email === email);
+
+  if (user) {
+    const update: ProfileUpdate = {
+      stripe_customer_id: customerId,
+      subscription_status: "active",
+      subscription_tier: tier,
+      subscribed_at: new Date().toISOString(),
+    };
+    await supabase.from("profiles").update(update).eq("id", user.id);
+  }
+  // If no user exists yet, the profile is created on sign-up via the
+  // handle_new_user trigger; stripe_customer_id is linked via subscription.updated.
 }
 
 async function handleSubscriptionDeleted(
@@ -41,9 +57,12 @@ async function handleSubscriptionDeleted(
     typeof subscription.customer === "string" ? subscription.customer : null;
   if (!customerId) return;
 
-  // TODO: Update subscription_status to "canceled" in Supabase — feature/supabase-auth
-  // await updateSubscriptionStatus({ stripeCustomerId: customerId, status: "canceled" });
-  console.log("[webhook] customer.subscription.deleted", { customerId });
+  const supabase = createSupabaseServiceClient();
+  const update: ProfileUpdate = { subscription_status: "canceled" };
+  await supabase
+    .from("profiles")
+    .update(update)
+    .eq("stripe_customer_id", customerId);
 }
 
 async function handleSubscriptionUpdated(
@@ -53,14 +72,25 @@ async function handleSubscriptionUpdated(
     typeof subscription.customer === "string" ? subscription.customer : null;
   if (!customerId) return;
 
-  const status = subscription.status as string;
+  const rawStatus = subscription.status;
+  const validStatuses = ["active", "canceled", "past_due"] as const;
+  const status = validStatuses.includes(rawStatus as (typeof validStatuses)[number])
+    ? (rawStatus as "active" | "canceled" | "past_due")
+    : null;
+
   const priceId = subscription.items.data[0]?.price.id;
-  const tier =
+  const tier: "starter" | "hands_off" =
     priceId === process.env.STRIPE_HANDS_OFF_PRICE_ID ? "hands_off" : "starter";
 
-  // TODO: Sync plan changes in Supabase — feature/supabase-auth
-  // await updateSubscription({ stripeCustomerId: customerId, tier, status });
-  console.log("[webhook] customer.subscription.updated", { customerId, tier, status });
+  const supabase = createSupabaseServiceClient();
+  const update: ProfileUpdate = {
+    subscription_status: status,
+    subscription_tier: tier,
+  };
+  await supabase
+    .from("profiles")
+    .update(update)
+    .eq("stripe_customer_id", customerId);
 }
 
 export async function POST(req: NextRequest) {
